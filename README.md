@@ -53,3 +53,7 @@ python3 assets/icons/render.py   # after changing the icon; needs rsvg-convert
 ```
 
 The tray icon is an original drawing, not official Evangelion artwork.
+
+## License
+
+MIT, see `LICENSE`.

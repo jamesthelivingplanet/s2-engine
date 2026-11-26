@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Start, stop and chat with local language models, one at a time"
+license = "MIT"
 publish = false
 
 [dependencies]
