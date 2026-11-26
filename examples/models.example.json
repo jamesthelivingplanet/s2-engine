@@ -1,0 +1,23 @@
+{
+  "runtimes": {
+    "system": "llama-server",
+    "custom": "~/src/llama.cpp/build/bin/llama-server"
+  },
+  "profiles": [
+    {
+      "name": "qwen",
+      "description": "Qwen3.5-9B Q4_K_M, all on the GPU",
+      "runtime": "system",
+      "model": "~/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf",
+      "alias": "qwen3.5-9b",
+      "context": 65536,
+      "port": 9931,
+      "args": ["--jinja", "-ngl", "99"],
+      "hermes": false,
+      "source": {
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "file": "Qwen3.5-9B-Q4_K_M.gguf"
+      }
+    }
+  ]
+}
