@@ -433,3 +433,19 @@ fn the_example_config_is_valid() {
     let example = include_str!("../examples/models.example.json");
     s2_engine::config::Config::parse(example).unwrap();
 }
+
+#[test]
+fn a_closed_pipe_ends_quietly() {
+    let s = Sandbox::new();
+    let profiles = (0..40).map(|i| s.profile(&format!("p{i}"), &[])).collect();
+    s.config(profiles);
+    let mut child = s
+        .command(&["list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(!text(&out).contains("panicked"), "{}", text(&out));
+}

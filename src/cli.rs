@@ -133,6 +133,12 @@ fn guard(config: Option<&Config>, force: bool) -> Result<()> {
 }
 
 fn run(command: Command) -> Result<ExitCode> {
+    // Piping into `head` should end quietly. The tray keeps Rust's default, so a
+    // lost D-Bus connection reaches it as an error instead of killing it.
+    if !matches!(command, Command::Tray { .. }) {
+        // SAFETY: restoring the default disposition installs no handler.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match command {
         Command::List => {
             let config = Config::load()?;
