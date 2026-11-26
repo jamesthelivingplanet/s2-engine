@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# llm                 list models + status
+# llm start [model]   start a model (menu if omitted); 9931 models also update ~/.hermes/config.yaml
+# llm stop            stop the server
+# llm status          what's running
+# llm talk <model> [system prompt]   chat in the terminal (starts the model if needed)
+# One model at a time (8 GB VRAM). pid: ~/llama-server.pid  log: ~/llama-server.log
+set -u
+PIDFILE=~/llama-server.pid
+LOG=~/llama-server.log
+HERMES_CFG=~/.hermes/config.yaml
+M="$HOME/models"
+PRISM="$HOME/.repositories/prism-llama.cpp/build/bin/llama-server"
+PRISM25="$HOME/src/prism-b12178/llama-prism-b12178-03ec600/llama-server"   # prebuilt, needed for Bonsai 2.5
+Q="--jinja -ctk q8_0 -ctv q8_0 -np 1 -ngl 99"
+Q_FIT="--jinja -ctk q8_0 -ctv q8_0 -np 1"
+
+# key|description|binary|alias|ctx|port|model path|extra flags   (-c/--alias/--host/--port are added)
+MODELS=(
+  "qwen|Qwen3.5-9B Q4_K_M (stock)|llama-server|qwen3.5-9b|65536|9931|$M/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf|$Q"
+  "hauhau|Qwen3.5-9B Uncensored HauhauCS Aggressive|llama-server|qwen3.5-9b|65536|9931|$M/qwen35-9b-hauhau/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf|$Q"
+  "gemma|Gemma-4-E4B-it Q4_K_M|llama-server|gemma4-e4b|131072|9931|$M/gemma4-e4b/gemma-4-E4B-it-Q4_K_M.gguf|$Q"
+  "lfm|LFM2.5-8B-A1B Q4_K_M|llama-server|lfm2.5-8b-a1b|128000|9931|$M/lfm25-8b-a1b/LFM2.5-8B-A1B-Q4_K_M.gguf|$Q"
+  "qwen36|Qwen3.6-35B-A3B UD-IQ3_XXS (13 GB, partial offload)|llama-server|qwen3.6-35b-a3b|65536|9931|$M/qwen36-35b-a3b/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf|$Q_FIT"
+  "bonsai|OrcaBonsai-27B + abliteration LoRA (fast, 32K ctx, q4 KV)|$PRISM|bonsai|32768|8080|$M/Ternary-Bonsai-2-27B-PTQ1_0.gguf|--lora $HOME/OrcaBonsai/gguf/bonsai-abliterate-lora.gguf -ngl 99 -ctk q4_0 -ctv q4_0 -fa on --temp 1.0 --top-p 0.95 --top-k 20 -np 1 -b 512 -ub 512"
+  "bonsai64|OrcaBonsai-27B + abliteration LoRA (SLOW ~3 tok/s, 64K ctx, partial CPU offload)|$PRISM|bonsai|65536|8080|$M/Ternary-Bonsai-2-27B-PTQ1_0.gguf|--lora $HOME/OrcaBonsai/gguf/bonsai-abliterate-lora.gguf -ctk q4_0 -ctv q4_0 -fa on --temp 1.0 --top-p 0.95 --top-k 20 -np 1 -b 512 -ub 512"
+  "bonsai25|Ternary-Bonsai-2.5-27B stock, no LoRA (~70 tok/s, 16K ctx)|$PRISM25|bonsai-2.5|16384|8080|$M/bonsai-25/Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf|--jinja -ngl 99 -ctk q8_0 -ctv q8_0 -fa on --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 -np 1 -ub 128"
+)
+
+running_pid() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && cat "$PIDFILE"; }
+running_alias() { local pid; pid=$(running_pid) || return 1; tr '\0' ' ' < /proc/$pid/cmdline | sed -n 's/.*--alias \([^ ]*\).*/\1/p'; }
+
+list() {
+  local cur i=1 k d name path; cur=$(running_alias 2>/dev/null)
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r k d _ name _ _ path _ <<<"$m"
+    printf '  %d) %-8s %-52s %s%s\n' "$i" "$k" "$d" "$([ -f "$path" ] && echo ok || echo MISSING)" \
+      "$([ -n "$cur" ] && [ "$name" = "$cur" ] && echo '   <- running')"
+    i=$((i+1))
+  done
+}
+
+stop() {
+  local pid; if pid=$(running_pid); then
+    local a; a=$(running_alias)
+    kill "$pid"; for _ in $(seq 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -0 "$pid" 2>/dev/null && { echo "pid $pid did not stop; try: kill -9 $pid" >&2; return 1; }
+    echo "${a:-model} stopped (pid $pid)"
+  else echo "no model running"; fi
+  rm -f "$PIDFILE"
+}
+
+start() {
+  local want="${1:-}" entry="" idx=0
+  if [ -z "$want" ]; then
+    echo "Select a model:"; list
+    [ -t 0 ] || exit 2
+    read -rp "> " want
+  fi
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r k _ <<<"$m"; idx=$((idx+1))
+    if [ "$want" = "$k" ] || [ "$want" = "$idx" ]; then entry=$m; break; fi
+  done
+  [ -n "$entry" ] || { echo "unknown model: $want" >&2; exit 2; }
+  IFS='|' read -r k d bin name ctx port path extra <<<"$entry"
+  [ -f "$path" ] || { echo "model file missing: $path" >&2; exit 1; }
+  running_pid >/dev/null && { stop || exit 1; }
+
+  # shellcheck disable=SC2086
+  nohup $bin -m "$path" -c "$ctx" $extra --alias "$name" --host 127.0.0.1 --port "$port" > "$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  echo "$k ($name) starting, pid $! — waiting for health..."
+  for _ in $(seq 240); do
+    kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo "server died; see $LOG" >&2; tail -5 "$LOG" >&2; rm -f "$PIDFILE"; exit 1; }
+    curl -sf -m 1 "http://127.0.0.1:$port/health" >/dev/null && break
+    sleep 1
+  done
+  curl -sf -m 1 "http://127.0.0.1:$port/health" >/dev/null || { echo "timed out; see $LOG" >&2; exit 1; }
+  if [ "$port" = 9931 ]; then
+    sed -i -E "/^model:/,/^[^ ]/{s/^(  default:).*/\1 $name/;s/^(  context_length:).*/\1 $ctx/}" "$HERMES_CFG"
+    echo "ready: $name on :$port — hermes config updated (ctx $ctx); restart hermes sessions"
+  else
+    echo "ready: $name on :$port (use hermes custom provider 'bonsai')"
+  fi
+}
+
+# Is the running server exactly this entry (same model file and context)?  (qwen/hauhau share an alias)
+running_is() {
+  local pid cmd; pid=$(running_pid) || return 1
+  cmd=$(tr '\0' ' ' < /proc/$pid/cmdline)
+  [[ $cmd == *" -m $1 "* && $cmd == *" -c $2 "* ]]
+}
+# llm talk <model> [system prompt]   chat in the terminal; starts the model first if needed
+talk() {
+  local want="${1:-}" entry="" idx=0 k d bin name ctx port path extra a cur
+  if [ -z "$want" ]; then echo "usage: llm talk <model> [system prompt]"; echo; list; exit 2; fi
+  shift
+  for m in "${MODELS[@]}"; do
+    IFS='|' read -r k _ <<<"$m"; idx=$((idx+1))
+    if [ "$want" = "$k" ] || [ "$want" = "$idx" ]; then entry=$m; break; fi
+  done
+  [ -n "$entry" ] || { echo "unknown model: $want" >&2; exit 2; }
+  IFS='|' read -r k d bin name ctx port path extra <<<"$entry"
+  if ! running_is "$path" "$ctx"; then
+    cur=$(running_alias 2>/dev/null)
+    if [ -n "$cur" ]; then
+      [ -t 0 ] || { echo "$cur is running, not $k; run: llm start $k" >&2; exit 1; }
+      read -rp "$cur is running. Stop it and start $k? [y/N] " a
+      case "$a" in y|Y) ;; *) exit 1 ;; esac
+    fi
+    start "$k" || exit 1
+  fi
+  python3 -c "$TALK_PY" "http://127.0.0.1:$port/v1/chat/completions" "$name" "$@"
+}
+TALK_PY=$(cat <<'EOF'
+import json, sys, urllib.request
+URL, MODEL = sys.argv[1], sys.argv[2]
+DIM, RESET = "\033[2m", "\033[0m"
+msgs = []
+if len(sys.argv) > 3:
+    msgs.append({"role": "system", "content": " ".join(sys.argv[3:])})
+print(f"Connected to {URL} ({MODEL}). /reset clears history, Ctrl-D exits.")
+while True:
+    try:
+        u = input("\n> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        break
+    if not u:
+        continue
+    if u == "/reset":
+        msgs = [m for m in msgs if m["role"] == "system"]
+        print("(history cleared)")
+        continue
+    msgs.append({"role": "user", "content": u})
+    req = urllib.request.Request(
+        URL,
+        json.dumps({"model": MODEL, "messages": msgs, "stream": True}).encode(),
+        {"Content-Type": "application/json"},
+    )
+    reply, thinking = "", False
+    try:
+        with urllib.request.urlopen(req) as r:
+            for line in r:
+                line = line.decode().strip()
+                if not line.startswith("data:") or line.endswith("[DONE]"):
+                    continue
+                d = json.loads(line[5:])["choices"][0]["delta"]
+                if d.get("reasoning_content"):
+                    if not thinking:
+                        sys.stdout.write(DIM); thinking = True
+                    sys.stdout.write(d["reasoning_content"])
+                if d.get("content"):
+                    if thinking:
+                        sys.stdout.write(RESET + "\n"); thinking = False
+                    sys.stdout.write(d["content"]); reply += d["content"]
+                sys.stdout.flush()
+        if thinking:
+            sys.stdout.write(RESET)
+        print()
+        msgs.append({"role": "assistant", "content": reply})
+    except KeyboardInterrupt:
+        print(RESET + "\n(interrupted)")
+        msgs.pop()
+    except Exception as e:
+        print(RESET + f"\nError: {e}")
+        msgs.pop()
+EOF
+)
+
+case "${1:-}" in
+  start)  start "${2:-}" ;;
+  stop)   stop ;;
+  status) if pid=$(running_pid); then echo "running pid $pid: $(running_alias)"; else echo "not running"; fi ;;
+  talk)   shift; talk "$@" ;;
+  ""|list|-h|--help) echo "Models:"; list; echo; echo "Usage: llm start [model] | llm stop | llm status | llm talk <model> [system prompt]" ;;
+  *) echo "usage: llm [start [model]|stop|status|talk <model>]" >&2; exit 2 ;;
+esac
