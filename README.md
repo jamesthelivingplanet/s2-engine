@@ -38,6 +38,8 @@ Outside a terminal, `start` and `stop` refuse to stop a running model without `-
 
 The server runs as `<runtime> -m <model> -c <context> <args> --alias <alias> --host 127.0.0.1 --port <port>`, with output in `~/llama-server.log` and its pid in `~/llama-server.pid`.
 
+On Omarchy, tray icons sit behind the bar's `<` arrow. To keep this one visible, add `"pinned": ["s2-engine"]` to the `omarchy.tray` entry in `~/.config/omarchy/shell.json`.
+
 ## Environment overrides
 
 `S2_CONFIG`, `S2_PIDFILE`, `S2_LOG`, `S2_STATE_DIR`, `S2_HERMES_CONFIG`, `S2_HF`, `S2_SYSTEMCTL`, `S2_START_TIMEOUT` (240 s), `S2_STOP_TIMEOUT` (30 s).
