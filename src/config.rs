@@ -36,6 +36,33 @@ pub struct Profile {
     pub hermes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Hooks>,
+}
+
+/// The user's own commands around a model's life.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    /// Shell command run before the model starts; if it fails the model does not start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre: Option<String>,
+    /// Shell command run after the model ends, however it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post: Option<String>,
+    /// Run both commands as root. The password is asked at every start.
+    #[serde(default)]
+    pub sudo: bool,
+    /// `pre` closes the desktop session, so a start needs a terminal and a yes.
+    #[serde(default)]
+    pub closes_session: bool,
+}
+
+impl Hooks {
+    /// Only someone at a terminal can type a password or agree to lose their session.
+    pub fn needs_terminal(&self) -> bool {
+        self.sudo || self.closes_session
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +165,18 @@ impl Config {
             }
             if profile.port == 0 {
                 return bad("port must be above 0");
+            }
+            if let Some(hooks) = &profile.hooks {
+                let commands = [&hooks.pre, &hooks.post];
+                if commands.iter().all(|c| c.is_none()) {
+                    return bad("hooks need a pre or a post command");
+                }
+                if commands.iter().any(|c| {
+                    c.as_ref()
+                        .is_some_and(|c| c.trim().is_empty() || c.contains('\0'))
+                }) {
+                    return bad("hook commands must not be empty");
+                }
             }
             if let Some(source) = &profile.source {
                 let inside = Path::new(&source.file)

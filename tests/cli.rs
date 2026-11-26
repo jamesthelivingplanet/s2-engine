@@ -11,6 +11,8 @@ const FAKE_HF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-hf.sh");
 
 struct Sandbox {
     dir: tempfile::TempDir,
+    /// Talk to the real user systemd, under a unit name no one else uses.
+    systemd: bool,
 }
 
 fn free_port() -> u16 {
@@ -25,6 +27,7 @@ impl Sandbox {
     fn new() -> Sandbox {
         Sandbox {
             dir: tempfile::tempdir().unwrap(),
+            systemd: false,
         }
     }
 
@@ -68,7 +71,13 @@ impl Sandbox {
             .env("S2_HERMES_CONFIG", self.path("hermes.yaml"))
             .env("S2_START_TIMEOUT", "15")
             .env("S2_HF", FAKE_HF)
-            .env("S2_SYSTEMCTL", "true");
+            .env("S2_SYSTEMCTL", "true")
+            .env("S2_UNIT", self.unit());
+        if self.systemd {
+            command
+                .env_remove("S2_SYSTEMCTL")
+                .env("S2_HOOK_TIMEOUT", "20");
+        }
         command
     }
 
@@ -448,4 +457,300 @@ fn a_closed_pipe_ends_quietly() {
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
     assert!(!text(&out).contains("panicked"), "{}", text(&out));
+}
+
+// ---- hooks ----
+
+impl Sandbox {
+    /// None where there is no user systemd to test against.
+    fn with_systemd() -> Option<Sandbox> {
+        let up = Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !up {
+            eprintln!("skipped: no user systemd");
+            return None;
+        }
+        let mut sandbox = Sandbox::new();
+        sandbox.systemd = true;
+        Some(sandbox)
+    }
+
+    fn unit(&self) -> String {
+        let id = self.dir.path().file_name().unwrap().to_string_lossy();
+        format!("s2-test-{}", id.trim_start_matches('.'))
+    }
+
+    /// A profile whose hooks append to `hooks.log`.
+    fn hooked(&self, name: &str, extra: &[&str]) -> Value {
+        let log = self.path("hooks.log").display().to_string();
+        let mut profile = self.profile(name, extra);
+        profile["hooks"] =
+            json!({"pre": format!("echo pre >> {log}"), "post": format!("echo post >> {log}")});
+        profile
+    }
+
+    fn hooks_ran(&self) -> String {
+        std::fs::read_to_string(self.path("hooks.log"))
+            .unwrap_or_default()
+            .replace('\n', " ")
+    }
+}
+
+fn eventually(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("never happened: {what}");
+}
+
+#[test]
+fn hooks_wrap_a_start_and_a_stop() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    s.config(vec![s.hooked("h", &[])]);
+    let out = s.ok(&["start", "h"]);
+    assert!(
+        out.contains("runs these commands:") && out.contains("ready: h-alias"),
+        "{out}"
+    );
+    assert_eq!(s.hooks_ran(), "pre ");
+    let pid = s.read("server.pid");
+    assert!(alive(&pid));
+    assert!(s.ok(&["status"]).contains("[profile h]"));
+    s.ok(&["stop", "--force"]);
+    // `stop` returns only once `post` is done.
+    assert_eq!(s.hooks_ran(), "pre post ");
+    assert!(!alive(&pid) && !s.path("server.pid").exists());
+}
+
+#[test]
+fn post_runs_when_the_server_is_killed() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    s.config(vec![s.hooked("h", &[])]);
+    s.ok(&["start", "h"]);
+    let pid: i32 = s.read("server.pid").trim().parse().unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    eventually("post after a crash", || s.hooks_ran() == "pre post ");
+    eventually("records cleared", || !s.path("server.pid").exists());
+}
+
+#[test]
+fn post_runs_when_the_unit_is_stopped() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    s.config(vec![s.hooked("h", &[])]);
+    s.ok(&["start", "h"]);
+    let pid = s.read("server.pid");
+    let unit = format!("{}.service", s.unit());
+    assert!(
+        Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status()
+            .unwrap()
+            .success()
+    );
+    eventually("post after systemctl stop", || s.hooks_ran() == "pre post ");
+    assert!(!alive(&pid));
+}
+
+#[test]
+fn post_runs_after_every_kind_of_failed_start() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    let mut bad_pre = s.hooked("badpre", &[]);
+    let log = s.path("hooks.log").display().to_string();
+    bad_pre["hooks"]["pre"] = format!("echo pre >> {log}; exit 3").into();
+    s.config(vec![
+        s.hooked("dies", &["--die"]),
+        s.hooked("hangs", &["--hang"]),
+        bad_pre,
+    ]);
+    for name in ["dies", "hangs", "badpre"] {
+        let _ = std::fs::remove_file(s.path("hooks.log"));
+        let _ = std::fs::remove_file(s.path("server.log"));
+        let out = s
+            .command(&["start", name])
+            .env("S2_START_TIMEOUT", "3")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{name}: {}", text(&out));
+        eventually(name, || s.hooks_ran() == "pre post ");
+        eventually("nothing left running", || !s.path("server.pid").exists());
+        eventually("unit gone", || s.ok(&["status"]) == "not running\n");
+        if name == "badpre" {
+            assert!(!s.path("server.log").exists(), "the model must not start");
+        }
+    }
+}
+
+#[test]
+fn switching_away_finishes_post_first() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    let mut h = s.hooked("h", &[]);
+    let log = s.path("hooks.log").display().to_string();
+    h["hooks"]["post"] = format!("sleep 1; echo post >> {log}").into();
+    s.config(vec![h, s.profile("plain", &[])]);
+    s.ok(&["start", "h"]);
+    s.ok(&["start", "plain", "--force"]);
+    assert_eq!(s.hooks_ran(), "pre post ");
+    assert!(s.ok(&["status"]).contains("[profile plain]"));
+}
+
+#[test]
+fn a_running_pre_blocks_other_starts_and_can_be_stopped() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    let mut slow = s.hooked("slow", &[]);
+    let log = s.path("hooks.log").display().to_string();
+    slow["hooks"]["pre"] = format!("echo pre >> {log}; sleep 15").into();
+    s.config(vec![slow, s.profile("plain", &[])]);
+    let mut starting = s
+        .command(&["start", "slow"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    eventually("pre running", || s.hooks_ran() == "pre ");
+    assert!(s.ok(&["status"]).contains("running a hook"));
+    assert!(
+        s.fails(&["start", "plain", "--force"])
+            .contains("still running its hooks")
+    );
+    s.ok(&["stop", "--force"]);
+    eventually("post", || s.hooks_ran() == "pre post ");
+    assert!(!starting.wait().unwrap().success());
+    assert!(!s.path("server.pid").exists());
+}
+
+#[test]
+fn hook_text_reaches_the_shell_unchanged() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    let out = s.path("text").display().to_string();
+    let mut h = s.profile("h", &[]);
+    let command = format!(
+        "x='two  words'\nprintf '%s|' \"$x\" '$x' '%h %% ;' \"q\\\"q\" 'back\\slash' \"$(echo sub)\" ${{x%% *}} > {out}"
+    );
+    h["hooks"] = json!({"pre": command});
+    s.config(vec![h]);
+    s.ok(&["start", "h"]);
+    assert_eq!(
+        s.read("text"),
+        r#"two  words|$x|%h %% ;|q"q|back\slash|sub|two|"#
+    );
+}
+
+#[test]
+fn hooks_needing_a_person_are_refused_without_a_terminal() {
+    let s = Sandbox::new();
+    let (mut root, mut closes) = (s.hooked("root", &[]), s.hooked("closes", &[]));
+    root["hooks"]["sudo"] = true.into();
+    closes["hooks"]["closes_session"] = true.into();
+    s.config(vec![root, closes]);
+    for name in ["root", "closes"] {
+        assert!(
+            s.fails(&["start", name, "--force"])
+                .contains("needs a person at a terminal")
+        );
+        assert!(s.fails(&["talk", name]).contains("start it first"));
+    }
+    assert_eq!(s.hooks_ran(), "");
+    let dry = s.ok(&["start", "root", "--dry-run"]);
+    for part in [
+        "sudo -k systemd-run",
+        "User=",
+        "ExecStartPre=+:/bin/sh",
+        "ExecStopPost=+:/bin/sh",
+        "__serve root --system",
+    ] {
+        assert!(dry.contains(part), "{part} missing from {dry}");
+    }
+    let dry = s.ok(&["start", "closes", "--dry-run"]);
+    assert!(
+        dry.contains("systemd-run --user") && !dry.contains("+:") && !dry.contains("User="),
+        "{dry}"
+    );
+}
+
+#[test]
+fn closing_the_session_needs_a_typed_yes() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    let mut h = s.hooked("h", &[]);
+    h["hooks"]["closes_session"] = true.into();
+    s.config(vec![h]);
+    // `script` provides the terminal.
+    let answer = |reply: &str| {
+        let mut command = s.command(&[]);
+        let mut script = Command::new("script");
+        script.args([
+            "-qec",
+            &format!("{} start h", env!("CARGO_BIN_EXE_s2")),
+            "/dev/null",
+        ]);
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => script.env(key, value),
+                None => script.env_remove(key),
+            };
+        }
+        command = script;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(format!("{reply}\n").as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        drop(stdin);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let out = answer("y");
+    assert!(
+        out.contains("closes your desktop session") && out.contains("nothing changed"),
+        "{out}"
+    );
+    assert_eq!(s.hooks_ran(), "");
+    let out = answer("yes");
+    assert!(out.contains("ready: h-alias"), "{out}");
+    assert_eq!(s.hooks_ran(), "pre ");
+}
+
+#[test]
+fn empty_hooks_are_invalid() {
+    let s = Sandbox::new();
+    for hooks in [
+        json!({}),
+        json!({"pre": "  "}),
+        json!({"pre": "x", "typo": 1}),
+    ] {
+        let mut a = s.profile("a", &[]);
+        a["hooks"] = hooks;
+        s.config(vec![a]);
+        assert!(s.fails(&["list"]).contains("invalid config"));
+    }
 }

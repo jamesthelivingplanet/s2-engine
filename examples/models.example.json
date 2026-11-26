@@ -18,6 +18,22 @@
         "repo": "unsloth/Qwen3.5-9B-GGUF",
         "file": "Qwen3.5-9B-Q4_K_M.gguf"
       }
+    },
+    {
+      "name": "headless",
+      "description": "The same model with the desktop stopped while it runs",
+      "runtime": "system",
+      "model": "~/models/qwen35-9b/Qwen3.5-9B-Q4_K_M.gguf",
+      "alias": "qwen3.5-9b",
+      "context": 131072,
+      "port": 9931,
+      "args": ["--jinja", "-ngl", "99"],
+      "hooks": {
+        "pre": "systemctl stop display-manager",
+        "post": "systemctl start display-manager",
+        "sudo": true,
+        "closes_session": true
+      }
     }
   ]
 }

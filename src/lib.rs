@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod hermes;
+pub mod hooked;
 pub mod manage;
 pub mod paths;
 pub mod server;

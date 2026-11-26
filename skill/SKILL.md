@@ -25,6 +25,10 @@ The running model may be the one serving you: hermes' default model is a local p
 
 Starting a profile with `"hermes": true` rewrites hermes' default model and context length; hermes sessions need a restart to pick it up.
 
+## Profiles with hooks
+
+`s2 show <name>` lists `hooks`: commands run around the model. A profile whose hooks have `sudo` or `closes_session` can only be started by the user at a terminal. Give them the command (`s2 start <name>`) and say what the hooks do; `closes_session` shuts their desktop. Editing a profile's `hooks` needs the user to name the exact commands.
+
 ## Adding a profile
 
 There is no terminal to prompt you, so pass every required value:

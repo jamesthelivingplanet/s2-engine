@@ -164,6 +164,7 @@ pub fn add(mut add: Add) -> Result<()> {
         args: add.args,
         hermes: add.hermes,
         source,
+        hooks: None,
         name: add.name,
     };
     let present = profile.model_path().is_file();

@@ -16,6 +16,10 @@ _Avoid_: binary, engine
 A named, runnable entry combining a model, a runtime and settings. Several profiles may share one model.
 _Avoid_: model (when the runnable entry is meant), preset
 
+**Hook**:
+A command of the user's own that runs before a profile's model starts, or after it ends.
+_Avoid_: script, trigger
+
 **Source**:
 The place a model can be downloaded from.
 _Avoid_: URL, origin

@@ -1,7 +1,7 @@
 //! Command line parsing and the everyday commands.
 
 use crate::config::{Config, Profile};
-use crate::{Result, manage, server, skill, talk, tray};
+use crate::{Result, hooked, manage, server, skill, talk, tray};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
@@ -59,6 +59,13 @@ enum Command {
         /// Skip the confirmation for --delete-file
         #[arg(long)]
         yes: bool,
+    },
+    /// Internal: the main process of a hooked profile's systemd unit
+    #[command(name = "__serve", hide = true)]
+    Serve {
+        profile: String,
+        #[arg(long)]
+        system: bool,
     },
     /// Print one profile
     Show { name: String },
@@ -132,6 +139,49 @@ fn guard(config: Option<&Config>, force: bool) -> Result<()> {
     }
 }
 
+/// Show a profile's hooks before they run, and get a yes if they end the session.
+fn agree(profile: &Profile) -> Result<bool> {
+    let Some(hooks) = &profile.hooks else {
+        return Ok(true);
+    };
+    if hooks.needs_terminal() && !interactive() {
+        return Err(format!(
+            "{} needs a person at a terminal: its hooks {}",
+            profile.name,
+            if hooks.closes_session {
+                "close the desktop session"
+            } else {
+                "run with sudo"
+            }
+        ));
+    }
+    let who = if hooks.sudo { " (as root)" } else { "" };
+    println!("{} runs these commands{who}:", profile.name);
+    for (label, command) in [("pre ", &hooks.pre), ("post", &hooks.post)] {
+        if let Some(command) = command {
+            println!("  {label}  {}", printable(command));
+        }
+    }
+    if !hooks.closes_session {
+        return Ok(true);
+    }
+    println!("This closes your desktop session and every program open in it.");
+    Ok(ask("Type yes to continue: ").as_deref() == Some("yes"))
+}
+
+/// Control characters could hide part of a command from the person approving it.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn run(command: Command) -> Result<ExitCode> {
     // Piping into `head` should end quietly. The tray keeps Rust's default, so a
     // lost D-Bus connection reaches it as an error instead of killing it.
@@ -171,7 +221,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 let line = server::command_line(&config, profile)?;
                 let quoted: Vec<_> = line.iter().map(|word| quote(word)).collect();
                 println!("{}", quoted.join(" "));
+                if profile.hooks.is_some() {
+                    let unit: Vec<_> = hooked::command(profile)?.iter().map(|w| quote(w)).collect();
+                    println!("{}", unit.join(" "));
+                }
             } else {
+                if !agree(profile)? {
+                    println!("nothing changed");
+                    return Ok(ExitCode::FAILURE);
+                }
                 guard(Some(&config), force)?;
                 server::start(&config, profile, &mut say)?;
             }
@@ -192,6 +250,12 @@ fn run(command: Command) -> Result<ExitCode> {
             };
             let profile = config.find(&wanted)?;
             if !server::running_is(&config, profile) {
+                if profile.hooks.is_some() {
+                    return Err(format!(
+                        "{0} has hooks; start it first with: s2 start {0}",
+                        profile.name
+                    ));
+                }
                 if let Some(run) = server::running(Some(&config)) {
                     if !interactive() {
                         return Err(format!(
@@ -210,6 +274,15 @@ fn run(command: Command) -> Result<ExitCode> {
                 server::start(&config, profile, &mut say)?;
             }
             talk::chat(profile, &system.join(" "))?;
+        }
+        Command::Serve { profile, system } => {
+            let config = Config::load()?;
+            let scope = if system {
+                hooked::Scope::System
+            } else {
+                hooked::Scope::User
+            };
+            server::serve(&config, config.find(&profile)?, scope)?;
         }
         Command::Add(add) => manage::add(add)?,
         Command::Remove {
@@ -269,7 +342,13 @@ fn list(config: &Config) {
 
 fn status(config: Option<&Config>) {
     match server::running(config) {
-        None => println!("not running"),
+        None => match hooked::active() {
+            Some(_) => println!(
+                "starting or stopping: {} is running a hook",
+                hooked::unit_name()
+            ),
+            None => println!("not running"),
+        },
         Some(run) => {
             let profile = run
                 .profile

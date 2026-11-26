@@ -39,9 +39,17 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub state: State,
-    /// Profile name and whether its model file is present.
-    pub profiles: Vec<(String, bool)>,
+    pub profiles: Vec<Entry>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub name: String,
+    /// The model file is there.
+    pub present: bool,
+    /// Its hooks need a person at a terminal.
+    pub terminal_only: bool,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -65,7 +73,11 @@ pub fn snapshot() -> Snapshot {
     let profiles = config
         .iter()
         .flat_map(|c| &c.profiles)
-        .map(|p| (p.name.clone(), p.model_path().is_file()))
+        .map(|p| Entry {
+            name: p.name.clone(),
+            present: p.model_path().is_file(),
+            terminal_only: p.hooks.as_ref().is_some_and(|h| h.needs_terminal()),
+        })
         .collect();
     Snapshot {
         state,
@@ -137,6 +149,9 @@ fn start_profile(name: String) {
     thread::spawn(move || {
         let result = Config::load().and_then(|config| {
             let profile = config.find(&name)?;
+            if profile.hooks.as_ref().is_some_and(|h| h.needs_terminal()) {
+                return Err(format!("start {name} from a terminal: s2 start {name}"));
+            }
             server::start(&config, profile, &mut |line| println!("{line}"))
         });
         if let Err(e) = result {
@@ -221,10 +236,15 @@ impl ksni::Tray for Tray {
             .seen
             .profiles
             .iter()
-            .map(|(name, present)| {
-                let name = name.clone();
-                let suffix = if *present { "" } else { " (missing)" };
-                item(format!("{name}{suffix}"), *present, move |_| {
+            .map(|entry| {
+                let name = entry.name.clone();
+                let suffix = match (entry.present, entry.terminal_only) {
+                    (false, _) => " (missing)",
+                    (true, true) => " (terminal only)",
+                    (true, false) => "",
+                };
+                let enabled = entry.present && !entry.terminal_only;
+                item(format!("{name}{suffix}"), enabled, move |_| {
                     start_profile(name.clone())
                 })
             })

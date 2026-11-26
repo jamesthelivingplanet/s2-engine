@@ -1,6 +1,7 @@
 //! The one running model server: start it, find it, stop it.
 
 use crate::config::{Config, Profile};
+use crate::hooked::{self, Scope};
 use crate::{Result, hermes, paths};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -18,19 +19,23 @@ pub struct Running {
     /// Name of the profile, when it can be told apart.
     pub profile: Option<String>,
     pub port: Option<u16>,
+    /// Set when a systemd unit runs this server between its hooks.
+    pub unit: Option<Scope>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct State {
     pid: i32,
     profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unit: Option<Scope>,
 }
 
 fn state_file() -> std::path::PathBuf {
     paths::state_dir().join("running.json")
 }
 
-fn seconds(name: &str, default: u64) -> Duration {
+pub(crate) fn seconds(name: &str, default: u64) -> Duration {
     let value = std::env::var(name).ok().and_then(|v| v.parse().ok());
     Duration::from_secs(value.unwrap_or(default))
 }
@@ -75,8 +80,9 @@ pub fn running(config: Option<&Config>) -> Option<Running> {
     let recorded = std::fs::read_to_string(state_file())
         .ok()
         .and_then(|text| serde_json::from_str::<State>(&text).ok())
-        .filter(|state| state.pid == pid)
-        .map(|state| state.profile);
+        .filter(|state| state.pid == pid);
+    let unit = recorded.as_ref().and_then(|state| state.unit);
+    let recorded = recorded.map(|state| state.profile);
     // A server started some other way is recognised by its model and context.
     let profile = recorded.or_else(|| {
         let matches: Vec<_> = config?
@@ -96,6 +102,7 @@ pub fn running(config: Option<&Config>) -> Option<Running> {
             .to_string(),
         profile,
         port: value_after(&args, "--port").and_then(|p| p.parse().ok()),
+        unit,
     })
 }
 
@@ -195,12 +202,27 @@ fn stop_locked(config: Option<&Config>) -> Result<String> {
     Ok(message)
 }
 
+/// Stop the running server and, for a hooked one, wait for its `post` command.
 pub fn stop(config: Option<&Config>) -> Result<String> {
-    let _guard = lock()?;
-    stop_locked(config)
+    let guard = lock()?;
+    let run = running(config);
+    let message = stop_locked(config)?;
+    // Released first: the unit's own process needs it on its way out.
+    drop(guard);
+    match run.and_then(|r| r.unit) {
+        Some(scope) => {
+            hooked::wait_until_gone(scope)?;
+            Ok(message)
+        }
+        None => match hooked::active() {
+            // Between hooks: there is no server to signal, only the unit.
+            Some(scope) => hooked::interrupt(scope),
+            None => Ok(message),
+        },
+    }
 }
 
-fn log_tail() -> String {
+pub(crate) fn log_tail() -> String {
     let bytes = std::fs::read(paths::log()).unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<_> = text.lines().collect();
@@ -224,16 +246,25 @@ fn spawn(config: &Config, profile: &Profile) -> Result<Child> {
         .map_err(|e| format!("cannot run {}: {e}", line[0]))
 }
 
-/// Replace whatever is running with `profile` and wait until it answers.
-/// Callers decide whether replacing is allowed.
-pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> Result<()> {
+/// Stop whatever is running ahead of a start, and refuse if the port or the
+/// hooked unit is still taken.
+pub(crate) fn clear_the_way(
+    config: &Config,
+    profile: &Profile,
+    say: &mut dyn FnMut(&str),
+) -> Result<()> {
     let model = profile.model_path();
     if !model.is_file() {
         return Err(format!("model file missing: {}", model.display()));
     }
-    let guard = lock()?;
     if running(Some(config)).is_some() {
-        say(&stop_locked(Some(config))?);
+        say(&stop(Some(config))?);
+    }
+    if hooked::active().is_some() {
+        return Err(format!(
+            "{} is still running its hooks; wait for it or stop it",
+            hooked::unit_name()
+        ));
     }
     if port_in_use(profile.port) {
         return Err(format!(
@@ -241,11 +272,21 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
             profile.port
         ));
     }
+    Ok(())
+}
+
+/// Start the server process and record it. The caller owns the returned child.
+fn launch(config: &Config, profile: &Profile, unit: Option<Scope>) -> Result<Child> {
+    let _guard = lock()?;
+    if running(Some(config)).is_some() {
+        return Err("another model was started meanwhile".into());
+    }
     let mut child = spawn(config, profile)?;
     let pid = child.id() as i32;
     let state = State {
         pid,
         profile: profile.name.clone(),
+        unit,
     };
     let recorded = paths::write_file(&paths::pidfile(), &format!("{pid}\n")).and_then(|()| {
         let json = serde_json::to_string(&state).expect("state serializes");
@@ -255,14 +296,19 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
         let _ = child.kill();
         return Err(e);
     }
-    drop(guard);
-    say(&format!(
-        "{} ({}) starting, pid {pid} — waiting for health...",
-        profile.name, profile.alias
-    ));
-    wait_for_health(&mut child, profile)?;
-    // Reap the server if it exits while this process (the tray) lives on.
-    thread::spawn(move || child.wait());
+    Ok(child)
+}
+
+fn starting_line(profile: &Profile, child: &Child) -> String {
+    format!(
+        "{} ({}) starting, pid {} — waiting for health...",
+        profile.name,
+        profile.alias,
+        child.id()
+    )
+}
+
+fn announce_ready(profile: &Profile, say: &mut dyn FnMut(&str)) {
     if profile.hermes {
         match hermes::update(&profile.alias, profile.context) {
             Ok(()) => say(&format!(
@@ -277,7 +323,59 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
     } else {
         say(&format!("ready: {} on :{}", profile.alias, profile.port));
     }
+}
+
+/// Replace whatever is running with `profile` and wait until it answers.
+/// Callers decide whether replacing is allowed.
+pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> Result<()> {
+    if profile.hooks.is_some() {
+        return hooked::start(config, profile, say);
+    }
+    clear_the_way(config, profile, say)?;
+    let mut child = launch(config, profile, None)?;
+    say(&starting_line(profile, &child));
+    wait_for_health(&mut child, profile)?;
+    // Reap the server if it exits while this process (the tray) lives on.
+    thread::spawn(move || child.wait());
+    announce_ready(profile, say);
     Ok(())
+}
+
+/// The main process of a hooked unit: run the server and stay until it ends, so
+/// that systemd runs `post` exactly then.
+pub(crate) fn serve(config: &Config, profile: &Profile, scope: Scope) -> Result<()> {
+    let mut say = |line: &str| println!("{line}");
+    let mut child = launch(config, profile, Some(scope))?;
+    say(&starting_line(profile, &child));
+    if let Err(e) = wait_for_health(&mut child, profile) {
+        // Unlike a plain start, a slow server cannot stay: `post` is waiting on it.
+        let _ = child.kill();
+        let _ = child.wait();
+        forget(child.id() as i32)?;
+        return Err(e);
+    }
+    announce_ready(profile, &mut say);
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let stopped_on_purpose = !forget(child.id() as i32)?;
+    if stopped_on_purpose || status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "server ended unexpectedly: {status}\n{}",
+            log_tail()
+        ))
+    }
+}
+
+/// Remove the records if they still describe `pid`; false if someone else already did.
+fn forget(pid: i32) -> Result<bool> {
+    let _guard = lock()?;
+    let ours = read_pid() == Some(pid);
+    if ours {
+        let _ = std::fs::remove_file(paths::pidfile());
+        let _ = std::fs::remove_file(state_file());
+    }
+    Ok(ours)
 }
 
 fn wait_for_health(child: &mut Child, profile: &Profile) -> Result<()> {
