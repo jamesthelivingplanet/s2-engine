@@ -530,6 +530,37 @@ fn hooks_wrap_a_start_and_a_stop() {
 }
 
 #[test]
+fn ready_is_reported_only_once_the_start_is_complete() {
+    let Some(s) = Sandbox::with_systemd() else {
+        return;
+    };
+    s.file(
+        "hermes.yaml",
+        "model:\n  default: old\n  context_length: 1\n",
+    );
+    let mut h = s.hooked("h", &[]);
+    h["hermes"] = true.into();
+    s.config(vec![h]);
+    let out = s.ok(&["start", "h"]);
+    assert!(out.contains("hermes config updated (ctx 512)"), "{out}");
+    assert!(s.read("hermes.yaml").contains("default: h-alias"));
+}
+
+#[test]
+fn a_multi_line_hook_is_shown_line_by_line() {
+    let s = Sandbox::new();
+    let mut h = s.profile("h", &[]);
+    h["hooks"] = json!({"pre": "echo one\necho two\u{1b}[2K", "sudo": false});
+    h["model"] = "/no/such/model".into();
+    s.config(vec![h]);
+    let out = s.fails(&["start", "h"]);
+    assert!(
+        out.contains("  pre   echo one\n        echo two\\u{1b}[2K\n"),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn post_runs_when_the_server_is_killed() {
     let Some(s) = Sandbox::with_systemd() else {
         return;

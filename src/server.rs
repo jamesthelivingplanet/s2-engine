@@ -29,6 +29,9 @@ struct State {
     profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unit: Option<Scope>,
+    /// A hooked unit's "ready" line, present once its start is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready: Option<String>,
 }
 
 fn state_file() -> std::path::PathBuf {
@@ -287,6 +290,7 @@ fn launch(config: &Config, profile: &Profile, unit: Option<Scope>) -> Result<Chi
         pid,
         profile: profile.name.clone(),
         unit,
+        ready: None,
     };
     let recorded = paths::write_file(&paths::pidfile(), &format!("{pid}\n")).and_then(|()| {
         let json = serde_json::to_string(&state).expect("state serializes");
@@ -306,6 +310,18 @@ fn starting_line(profile: &Profile, child: &Child) -> String {
         profile.alias,
         child.id()
     )
+}
+
+fn read_state() -> Option<State> {
+    let text = std::fs::read_to_string(state_file()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The "ready" line of the hooked start of `profile`, once there is one.
+pub(crate) fn ready_line(profile: &str) -> Option<String> {
+    let state = read_state()?;
+    (state.profile == profile && read_pid() == Some(state.pid) && cmdline(state.pid).is_some())
+        .then_some(state.ready)?
 }
 
 fn announce_ready(profile: &Profile, say: &mut dyn FnMut(&str)) {
@@ -334,7 +350,9 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
     clear_the_way(config, profile, say)?;
     let mut child = launch(config, profile, None)?;
     say(&starting_line(profile, &child));
-    wait_for_health(&mut child, profile)?;
+    wait_for_health(&mut child, profile).map_err(|e| match e {
+        StartError::Stopped(message) | StartError::Failed(message) => message,
+    })?;
     // Reap the server if it exits while this process (the tray) lives on.
     thread::spawn(move || child.wait());
     announce_ready(profile, say);
@@ -344,19 +362,30 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
 /// The main process of a hooked unit: run the server and stay until it ends, so
 /// that systemd runs `post` exactly then.
 pub(crate) fn serve(config: &Config, profile: &Profile, scope: Scope) -> Result<()> {
-    let mut say = |line: &str| println!("{line}");
     let mut child = launch(config, profile, Some(scope))?;
-    say(&starting_line(profile, &child));
-    if let Err(e) = wait_for_health(&mut child, profile) {
-        // Unlike a plain start, a slow server cannot stay: `post` is waiting on it.
-        let _ = child.kill();
-        let _ = child.wait();
-        forget(child.id() as i32)?;
-        return Err(e);
+    println!("{}", starting_line(profile, &child));
+    let pid = child.id() as i32;
+    match wait_for_health(&mut child, profile) {
+        Ok(()) => {}
+        // Stopping a model that is still loading is not a failure.
+        Err(StartError::Stopped(message)) => {
+            println!("{message}");
+            return Ok(());
+        }
+        Err(StartError::Failed(message)) => {
+            // Unlike a plain start, a slow server cannot stay: `post` is waiting on it.
+            let _ = child.kill();
+            let _ = child.wait();
+            forget(pid)?;
+            return Err(message);
+        }
     }
-    announce_ready(profile, &mut say);
+    let mut line = String::new();
+    announce_ready(profile, &mut |text| line = text.to_string());
+    println!("{line}");
+    mark_ready(pid, line)?;
     let status = child.wait().map_err(|e| e.to_string())?;
-    let stopped_on_purpose = !forget(child.id() as i32)?;
+    let stopped_on_purpose = !forget(pid)?;
     if stopped_on_purpose || status.success() {
         Ok(())
     } else {
@@ -364,6 +393,19 @@ pub(crate) fn serve(config: &Config, profile: &Profile, scope: Scope) -> Result<
             "server ended unexpectedly: {status}\n{}",
             log_tail()
         ))
+    }
+}
+
+fn mark_ready(pid: i32, line: String) -> Result<()> {
+    let _guard = lock()?;
+    match read_state().filter(|state| state.pid == pid) {
+        Some(mut state) => {
+            state.ready = Some(line);
+            let json = serde_json::to_string(&state).expect("state serializes");
+            paths::write_file(&state_file(), &json)
+        }
+        // Stopped in the meantime: nothing to mark.
+        None => Ok(()),
     }
 }
 
@@ -378,29 +420,41 @@ fn forget(pid: i32) -> Result<bool> {
     Ok(ours)
 }
 
-fn wait_for_health(child: &mut Child, profile: &Profile) -> Result<()> {
+enum StartError {
+    /// Someone stopped or replaced it while it loaded.
+    Stopped(String),
+    Failed(String),
+}
+
+fn wait_for_health(child: &mut Child, profile: &Profile) -> std::result::Result<(), StartError> {
     let deadline = Instant::now() + seconds("S2_START_TIMEOUT", 240);
     loop {
         if !matches!(child.try_wait(), Ok(None)) {
-            let _guard = lock()?;
+            let _guard = lock().map_err(StartError::Failed)?;
             // Someone else may have replaced it; only clean up our own record.
             let ours = read_pid() == Some(child.id() as i32);
             if ours {
                 let _ = std::fs::remove_file(paths::pidfile());
                 let _ = std::fs::remove_file(state_file());
-                return Err(format!(
+                return Err(StartError::Failed(format!(
                     "server died; see {}\n{}",
                     paths::log().display(),
                     log_tail()
-                ));
+                )));
             }
-            return Err(format!("{} was stopped before it was ready", profile.name));
+            return Err(StartError::Stopped(format!(
+                "{} was stopped before it was ready",
+                profile.name
+            )));
         }
         if healthy(profile.port) {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("timed out; see {}", paths::log().display()));
+            return Err(StartError::Failed(format!(
+                "timed out; see {}",
+                paths::log().display()
+            )));
         }
         thread::sleep(Duration::from_secs(1).min(seconds("S2_START_TIMEOUT", 240)));
     }

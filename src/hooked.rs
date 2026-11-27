@@ -196,10 +196,8 @@ pub fn start(config: &Config, profile: &Profile, say: &mut dyn FnMut(&str)) -> R
     ));
     let deadline = Instant::now() + server::seconds("S2_START_TIMEOUT", 240);
     loop {
-        let ours = server::running(Some(config))
-            .is_some_and(|r| r.profile.as_deref() == Some(profile.name.as_str()));
-        if ours && server::healthy(profile.port) {
-            say(&format!("ready: {} on :{}", profile.alias, profile.port));
+        if let Some(line) = server::ready_line(&profile.name) {
+            say(&line);
             return Ok(());
         }
         if !busy(scope) {

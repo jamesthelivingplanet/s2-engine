@@ -159,7 +159,10 @@ fn agree(profile: &Profile) -> Result<bool> {
     println!("{} runs these commands{who}:", profile.name);
     for (label, command) in [("pre ", &hooks.pre), ("post", &hooks.post)] {
         if let Some(command) = command {
-            println!("  {label}  {}", printable(command));
+            for (i, line) in command.lines().enumerate() {
+                let label = if i == 0 { label } else { "    " };
+                println!("  {label}  {}", printable(line));
+            }
         }
     }
     if !hooks.closes_session {
